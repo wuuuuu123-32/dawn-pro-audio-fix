@@ -62,11 +62,13 @@ switch ($Action) {
             Write-Host "找不到守护脚本：$guard" -ForegroundColor Red
             exit 1
         }
-        $action = New-ScheduledTaskAction -Execute $psExe -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$guard`""
+        $taskAction = New-ScheduledTaskAction -Execute $psExe -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$guard`""
         $trigger = New-ScheduledTaskTrigger -AtStartup
         $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
-        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew
-        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+        # StopOnIdleEnd 默认是 true —— 意思是「用户一活动（结束空闲）就把任务停掉」，
+        # 2026-10-20 排查发现守护每次启动后活不过几秒就是被这条杀掉的，必须显式关掉。
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -DontStopOnIdleEnd -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew
+        Register-ScheduledTask -TaskName $taskName -Action $taskAction -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
         Write-Host "已注册计划任务 $taskName（开机自启，SYSTEM 身份）" -ForegroundColor Green
         Start-ScheduledTask -TaskName $taskName
         Start-Sleep -Seconds 3

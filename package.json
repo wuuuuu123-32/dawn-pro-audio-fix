@@ -1,0 +1,25 @@
+{
+  "name": "dawn-pro-audio-fix",
+  "version": "1.0.0",
+  "description": "修复 MOONDROP Dawn Pro 在 Windows 上「连上了却不出声」的音频引擎卡死：手动一键修复 + 后台守护",
+  "keywords": [
+    "windows",
+    "audio",
+    "usb-dac",
+    "moondrop",
+    "audiosrv",
+    "powershell"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wuuuuu123-32/dawn-pro-audio-fix.git"
+  },
+  "scripts": {
+    "check": "powershell -ExecutionPolicy Bypass -File fix-audio.ps1 -CheckOnly"
+  },
+  "os": [
+    "win32"
+  ],
+  "private": true
+}
