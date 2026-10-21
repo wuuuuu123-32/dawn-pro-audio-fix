@@ -82,6 +82,19 @@ $settings = New-ScheduledTaskSettingsSet -DontStopOnIdleEnd   # 对应 XML 里�
 
 踩过的现场：守护每次启动活不过几秒、日志里什么都不留、看起来像「脚本自己崩了」——其实不是崩，是被调度器杀的。`guard-task.ps1` 里已经加上这个参数了；如果你自己改注册脚本，别忘了它。
 
+## 改完代码必须重启守护进程（第二个坑）
+
+计划任务指向的是 `audio-guard.ps1` 的**路径**，但 PowerShell 是**启动那一刻把脚本整个读进内存**的。所以你改完文件、任务状态照样显示 `Running`，实际跑的还是旧代码，日志里也看不出任何异常 —— 2026-10-21 修 bug 时就撞上过：任务重装成功、PID 却是 10:36 那个旧的。
+
+正确做法是杀掉旧进程再启动任务：
+
+```powershell
+Stop-Process -Id <旧 PID> -Force
+Start-ScheduledTask -TaskName DawnProAudioGuard
+```
+
+`guard-task.ps1 -Action install` 内部会处理这件事（它注册完会尝试清理同名进程），但 SYSTEM 身份的进程需要管理员权限才杀得掉，所以如果你不是用管理员跑的它，回头记得自己确认一下新进程的 `CreationDate` 是不是刚才。
+
 ## 依赖与前提
 
 - Windows 10 / 11
