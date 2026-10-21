@@ -13,8 +13,9 @@
               判据用 PlaybackManager 的流状态，不用 CPU：
               audiodg 空闲时每 5 秒也在吃约 0.02 到 0.13 秒 CPU，和播放时分不开（已实测）。
               「最后一条流事件是 25/22，或没有」= 无流，从那一刻起算静置；
-              连续 IdleMinutes 分钟无流 → 预防性重启 Audiosrv（此时没人在听）。
-              每个静置周期只刷一次：刷过之后不再重复，直到检测到新的流启动(24)。
+              连续 IdleMinutes 分钟无流 → 预防性重启 Audiosrv（此时没人在听）；
+              只要距上次刷新满 RefreshIntervalMinutes 分钟就会再刷一次，
+              所以长时间静置（比如一整夜）期间引擎也是被定期刷新的，不会「刷一次就锁死」。
               这条能覆盖「静置后首播失败」，因为它根本不等播放发生。
 
               ⚠️ 已知局限（2026-10-20 第二轮会审）：
@@ -47,7 +48,9 @@ param(
     [int]$RunSeconds = 0,
     [int]$StreamThreshold = 5,
     [int]$StreamWindowSeconds = 120,
-    [int]$IdleMinutes = 30
+    [int]$IdleMinutes = 30,
+    [int]$RefreshIntervalMinutes = 60,   # 两次「静置刷新」之间的最小间隔（不是每轮只刷一次）
+    [double]$StartupGraceMinutes = 5   # 守护自己至少醒这么久，才允许做第一次静置刷新
 )
 
 $ErrorActionPreference = 'Continue'
@@ -178,7 +181,7 @@ function Invoke-Reset {
 
 # ---------------- 启动 ----------------
 Write-Log '=== Dawn Pro 音频守护启动 ==='
-Write-Log ("参数：DryRun={0} Simulate={1} Poll={2}s Cooldown={3}s MaxPerHour={4} Idle={5}min" -f $DryRun, $Simulate, $PollSeconds, $CooldownSeconds, $MaxPerHour, $IdleMinutes)
+Write-Log ("参数：DryRun={0} Simulate={1} Poll={2}s Cooldown={3}s MaxPerHour={4} Idle={5}min Refresh={6}min" -f $DryRun, $Simulate, $PollSeconds, $CooldownSeconds, $MaxPerHour, $IdleMinutes, $RefreshIntervalMinutes)
 
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin -and -not $DryRun) {
@@ -206,12 +209,16 @@ $lastHeartbeat = Get-Date
 $runStart = Get-Date
 $streaming = $false               # 是否有活跃音频流（最后一条流事件是 24 且还没收到 25）
 $lastStreamStop = Get-Date        # 最后一次「流结束 / 暂停」的时刻，静置计时起点
-$refreshedThisIdle = $false       # 本轮静置周期内是否已刷新过（每轮只刷一次，避免反复重启）
+$lastRefreshTime = [datetime]::MinValue  # 上次刷新引擎的时刻；静置期间按 RefreshIntervalMinutes 反复刷，不是只刷一次
 # 引擎刚重建过（audiodg 启动不到 10 分钟）就不必再刷一次，否则守护每次重启都会立刻多刷一遍
 $ag = Get-Process audiodg -ErrorAction SilentlyContinue
 if ($ag -and ((Get-Date) - $ag.StartTime).TotalMinutes -lt 10) {
-    $refreshedThisIdle = $true
-    Write-Log ('启动检测：audiodg 于 {0:HH:mm:ss} 启动，不足 10 分钟，视为引擎刚刷新过' -f $ag.StartTime)
+    # 引擎刚重建过：只是「刚刷过」这一点要记住，不是把整轮静置都豁免掉
+    $lastRefreshTime = $ag.StartTime
+    Write-Log ('启动检测：audiodg 于 {0:HH:mm:ss} 启动，不足 10 分钟，视为引擎刚刷新过（{1} 分钟后才允许再刷）' -f $ag.StartTime, $RefreshIntervalMinutes)
+}
+else {
+    Write-Log '启动检测：audiodg 不是刚重建，lastRefreshTime 保持初始值（首轮满足静置条件即可刷新）'
 }
 
 # 启动时先扫一遍最近的流事件，建立「当前是否在播放」的初始状态
@@ -256,7 +263,6 @@ while ($true) {
         if ($e.Id -eq 24) {
             $pendingStart = $e.TimeCreated
             $streaming = $true
-            $refreshedThisIdle = $false   # 开始播放了，下一轮静置可以再刷一次
         } elseif ($e.Id -eq 25) {
             if ($pendingStart) {
                 $alive = ($e.TimeCreated - $pendingStart).TotalSeconds
@@ -288,25 +294,28 @@ while ($true) {
     #   最后一条流事件是 24（流启动、还没收到 25）→ 正在播放，不动它
     #   最后一条是 25/22（流停止/暂停），或压根没有新事件 → 无流，从那一刻开始算静置
     # 这样即使故障期间一条事件都没有（10-20 20:43 那次就是），也能按「最后一次停止」计时
-    if ($streaming -and ($now - $lastStreamStop).TotalHours -ge 6) {
-        Write-Log '流状态已持续 6 小时未见停止事件，按无流处理（防止应用没发 25 导致永远不复位）' 'WARN'
+    if ($streaming -and ($now - $lastStreamStop).TotalHours -ge 12) {
+        Write-Log '流状态已持续 12 小时未见停止事件，按无流处理（防止应用没发 25 导致永远不复位）；同时把静置计时起点重置为现在，免得立刻触发刷新' 'WARN'
         $streaming = $false
+        $lastStreamStop = $now
     }
 
-    if (-not $streaming -and -not $refreshedThisIdle) {
-        $idleMin = ($now - $lastStreamStop).TotalMinutes
-        if ($idleMin -ge $IdleMinutes) {
-            # 触发前复查：最近 60 秒内有任何音频事件就跳过（降低「刚好开始播放」的误判）
-            $recentEvs = @(Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-Audio/PlaybackManager'; StartTime = $now.AddSeconds(-60) } -ErrorAction SilentlyContinue)
-            if ($recentEvs.Count -gt 0) {
-                Write-Log ("静置 {0:N0} 分钟，但最近 60 秒有 {1} 条新音频事件，跳过本次刷新" -f $idleMin, $recentEvs.Count)
-            }
-            else {
-                $didReset = Invoke-Reset -Reason ("已静置 {0:N0} 分钟无音频流（最后一条流事件是停止/暂停），预防性刷新引擎" -f $idleMin)
-                if ($didReset) {
-                    $lastStreamStop = Get-Date
-                    $refreshedThisIdle = $true
-                }
+    $idleMin = ($now - $lastStreamStop).TotalMinutes
+    $sinceRefresh = ($now - $lastRefreshTime).TotalMinutes
+    $awakeMin = ($now - $runStart).TotalMinutes
+    # 三个门同时满足才刷：① 没有活跃流 ② 静置够久 ③ 距上次刷新够久（否则静置一小时就只刷一次）
+    # 外加 ④ 守护自己至少醒了 5 分钟，避免刚启动就刷（那是无意义的抖动）
+    if (-not $streaming -and $idleMin -ge $IdleMinutes -and $sinceRefresh -ge $RefreshIntervalMinutes -and $awakeMin -ge $StartupGraceMinutes) {
+        # 触发前复查：最近 60 秒内有任何音频事件就跳过（降低「刚好开始播放」的误判）
+        $recentEvs = @(Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-Audio/PlaybackManager'; StartTime = $now.AddSeconds(-60) } -ErrorAction SilentlyContinue)
+        if ($recentEvs.Count -gt 0) {
+            Write-Log ("静置 {0:N0} 分钟，但最近 60 秒有 {1} 条新音频事件，跳过本次刷新" -f $idleMin, $recentEvs.Count)
+        }
+        else {
+            $didReset = Invoke-Reset -Reason ("已静置 {0:N0} 分钟无音频流（最后一条流事件是停止/暂停），预防性刷新引擎" -f $idleMin)
+            if ($didReset) {
+                $lastRefreshTime = Get-Date
+                $lastStreamStop = $lastRefreshTime
             }
         }
     }

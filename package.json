@@ -1,6 +1,6 @@
 {
   "name": "dawn-pro-audio-fix",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "修复 MOONDROP Dawn Pro 在 Windows 上「连上了却不出声」的音频引擎卡死：手动一键修复 + 后台守护",
   "keywords": [
     "windows",
