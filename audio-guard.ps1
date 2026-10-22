@@ -1,56 +1,84 @@
 ﻿<#
-  Dawn Pro 音频守护（B 方案）
+  Dawn Pro 音频守护（v1.2.0）
 
-  背景：这个 USB DAC 有两类故障，表现都是「设备在线、端点 ACTIVE、服务在跑，
-        但播放器建流失败（进度条走却没声音 / 播放器卡住）」，手动重启 Audiosrv 能好：
-    1) 设备经历大量 USB 瞬断后，音频引擎状态被拖坏
-    2) 零掉线、长时间运行后引擎自己卡死
+  背景：这个 USB DAC 有三类故障，表现都是「设备在线、端点 ACTIVE、服务在跑，
+        但播放器出不来声音」，手动重启 Audiosrv 能好（约 4 秒）：
+    1) Type-C 口物理松动 → 设备反复瞬断（Event 65 在 1/4 之间狂跳）
+    2) 零掉线，但长时间运行后引擎内部流对象坏死（进度条走，没声音）
+    3) 长时间不播放后第一次播放失败（日志里一条事件都没有）
 
-  做法（按第二轮会审意见设计，2026-10-20 改）：
-    - 主判据：静置刷新（按墙钟时间，不等播放发生）
-              会审指出 20:43 那次故障「零流事件」，任何只盯「建流失败」的判据
-              都看不到它，必须改成按时间判断。
-              判据用 PlaybackManager 的流状态，不用 CPU：
-              audiodg 空闲时每 5 秒也在吃约 0.02 到 0.13 秒 CPU，和播放时分不开（已实测）。
-              「最后一条流事件是 25/22，或没有」= 无流，从那一刻起算静置；
-              连续 IdleMinutes 分钟无流 → 预防性重启 Audiosrv（此时没人在听）；
-              只要距上次刷新满 RefreshIntervalMinutes 分钟就会再刷一次，
-              所以长时间静置（比如一整夜）期间引擎也是被定期刷新的，不会「刷一次就锁死」。
-              这条能覆盖「静置后首播失败」，因为它根本不等播放发生。
+  判据设计（2026-10-22 第三轮会审后重做）：
 
-              ⚠️ 已知局限（2026-10-20 第二轮会审）：
-                 PlaybackManager 事件里没有任何会话/流标识字段（实测 EventData.Data
-                 全空），只能维护一个全局布尔值。多应用同时播放时，A 停了可能把
-                 状态置为「无流」而 B 还在播，若恰好静置满 30 分钟会误重启一次
-                 （打断约 5 秒，播放器多半会自动续播）。权衡：误重启的代价远小于
-                 故障时完全没声音。缓解：触发前复查最近 60 秒有无新事件，有则跳过。
-    - 辅判据：PlaybackManager 里「短命音频流」模式（流启动后 5 秒内就停止，
-              120 秒内出现 5 次）——播放器建流失败且留下了事件时用它。
-              ⚠️ 挡不住「快速连续切歌 / 拖进度条 / 通知音」的误触发，所以阈值很宽。
-    - 补偿信号：Dawn Pro 端点从非 ACTIVE 恢复为 ACTIVE（Event 65 的等价判断）
-    - 复位分级：端点非 ACTIVE 时先只重启这个 USB 设备（pnputil /restart-device），
-              3 秒后还不行才重启 Audiosrv；端点本来就 ACTIVE（引擎层卡死）时
-              直接跳到重启 Audiosrv，不做无用的第一级
-    - 限流：两次复位间隔不小于 CooldownSeconds；一小时内最多 MaxPerHour 次（2）
-    - 状态判断用位掩码（ACTIVE=0x1），不精确匹配 4/1
+    会审直接否掉了我原来两个假设：
+      - 「峰值 0 = 没在播放」不成立：独占模式 / ASIO / Kernel Streaming 绕过
+        软件峰值表，一直在播也读 0
+      - 「峰值 > 0 = 正常」不成立：故障在下游（USB 输出、DAC）时软件混音照跑，
+        坏了也读正常
+    结论：只看「输出量」永远同时存在漏修和误伤，必须引入独立的
+    「应该正在输出」依据。
+
+    于是改用两个独立信号：
+      ① WASAPI 峰值（IAudioMeterInformation）：过去 90 秒窗口内密采（每轮连采
+         5 次、间隔 200ms），取最大值 → 判断「有没有数字音频在流」
+      ② 用户输入空闲（GetLastInputInfo）：判断「有没有人在用这台电脑」
+    第二条是关键：人不在，就一定没人在听，这时重启绝对安全。
+
+    判据 A（强信号，覆盖「正在用时坏死」）：
+        streaming=True（确实收到过 PlaybackManager Event 24）
+        且 90 秒窗口峰值全 < SilenceThreshold
+        → 有播放意图 + 无音频输出 = 确定故障 → 重启（冷却 HardCooldownSeconds）
+
+    判据 B（预防信号，覆盖「静置后首播失败」）：
+        用户输入空闲 >= IdleMinutes 分钟
+        且 90 秒窗口峰值全 < SilenceThreshold
+        → 没人在用、也没声音 → 重启安全（冷却 RefreshIntervalMinutes）
+
+    判据 C（兜底，绝不误伤）：
+        WASAPI 读不到（独占模式 / 端点不存在 / 初始化失败）
+        → 视为「未知」，不重启，日志记 WARN。
+        绝不降级回 PlaybackManager 判据 —— 那个已被实测证实会误伤。
+
+    已知局限（会审列出的反例，权衡后接受）：
+      - 播客 / 有声书有超过 90 秒的静音段，若此时人也不在，会被判据 B 刷一次
+        （无人在听，无感；风险是重启可能销毁仍被播放器持有的音频客户端）
+      - 其他应用持续发声会掩盖目标播放器坏死 → 判据 A 不触发（漏修）
+      - 独占 / ASIO 输出绕过峰值表 → 判据 A 不触发（漏修），这类请手动修
+      - 多用户会话：任务跑在注册的那个账号会话里，不一定是正在用 DAC 的会话
+      - FastUserSwitch 期间 Interactive 任务可能停在旧会话
+
+    运行身份：计划任务注册为「当前用户 + 最高权限 + 交互登录」。
+      必须交互登录，因为 SYSTEM 会话（Session 0）访问不到用户会话的音频设备图。
+
+    其余保留：
+      - 补偿信号：Dawn Pro 端点从非 ACTIVE 恢复为 ACTIVE
+      - 复位分级：端点非 ACTIVE 先 pnputil /restart-device，3 秒后不行再重启服务；
+        端点已 ACTIVE（引擎层卡死）直接跳到重启服务
+      - 限流：CooldownSeconds / MaxPerHour 双重闸
+      - 状态用位掩码（ACTIVE=0x1）
 
   用法：
     -DryRun    只记录不动作（用来观察是否会误触发）
     -Simulate  立刻走一次复位流程然后退出
-    正常运行需要管理员权限，建议用 install-guard.cmd 注册成开机计划任务
+    正常运行需要管理员权限，建议用 install-guard.cmd 注册成登录计划任务
 #>
 param(
     [switch]$DryRun,
     [switch]$Simulate,
+    [switch]$DebugPeak,
     [int]$PollSeconds = 5,
     [int]$CooldownSeconds = 60,
-    [int]$MaxPerHour = 2,
+    [int]$MaxPerHour = 4,
     [int]$RunSeconds = 0,
     [int]$StreamThreshold = 5,
     [int]$StreamWindowSeconds = 120,
-    [int]$IdleMinutes = 30,
-    [int]$RefreshIntervalMinutes = 60,   # 两次「静置刷新」之间的最小间隔（不是每轮只刷一次）
-    [double]$StartupGraceMinutes = 5   # 守护自己至少醒这么久，才允许做第一次静置刷新
+    [int]$IdleMinutes = 30,              # 用户输入空闲多少分钟才算「人不在」
+    [int]$RefreshIntervalMinutes = 60,   # 判据 B 两次刷新之间的最小间隔
+    [int]$HardCooldownSeconds = 120,     # 判据 A（确定故障）的冷却，比 B 短，故障时效优先
+    [int]$PeakWindowSeconds = 90,        # 峰值滑动窗口长度
+    [double]$SilenceThreshold = 0.0005,  # 低于它视为「没有音频输出」（约 -66 dBFS）
+    [int]$ProbeBurst = 5,                # 每轮连采几次
+    [int]$ProbeGapMs = 200,              # 连采间隔
+    [double]$StartupGraceMinutes = 5     # 守护自己至少醒这么久才允许第一次动作
 )
 
 $ErrorActionPreference = 'Continue'
@@ -74,6 +102,159 @@ trap {
     try { Add-Content -LiteralPath (Join-Path $scriptDir '_crash.txt') -Value $m -Encoding UTF8 } catch { }
     continue
 }
+
+# ---------------- WASAPI 峰值探针 + 用户输入空闲 ----------------
+# 注意：这段 C# 是 C# 5 语法（Add-Type 在 PS 5.1 下用老编译器），别用新特性。
+$probeSrc = @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class DshAudioProbe
+{
+    [ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")]
+    private class MMDeviceEnumeratorComObject { }
+
+    [ComImport, Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"),
+     InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IMMDeviceEnumerator
+    {
+        int EnumAudioEndpoints(int dataFlow, int stateMask, out IntPtr devices);
+        int GetDefaultAudioEndpoint(int dataFlow, int role, out IMMDevice device);
+        int GetDevice([MarshalAs(UnmanagedType.LPWStr)] string id, out IMMDevice device);
+        int RegisterEndpointNotificationCallback(IntPtr client);
+        int UnregisterEndpointNotificationCallback(IntPtr client);
+    }
+
+    [ComImport, Guid("D666063F-1587-4E43-81F1-B948E807363F"),
+     InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IMMDevice
+    {
+        int Activate(ref Guid iid, int dwClsCtx, IntPtr pActivationParams,
+                     [MarshalAs(UnmanagedType.IUnknown)] out object ppInterface);
+        int OpenPropertyStore(int stgmAccess, out IntPtr properties);
+        int GetId([MarshalAs(UnmanagedType.LPWStr)] out string id);
+        int GetState(out int state);
+    }
+
+    [ComImport, Guid("C02216F6-8C67-4B5B-9D00-D008E73E0064"),
+     InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IAudioMeterInformation
+    {
+        int GetPeakValue(out float pfPeak);
+        int GetMeteringChannelCount(out int pnChannelCount);
+        int GetChannelsPeakValues(int u32ChannelCount, [Out] float[] afPeakValues);
+        int QueryHardwareSupport(out int pdwHardwareSupportMask);
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct LASTINPUTINFO
+    {
+        public uint cbSize;
+        public uint dwTime;
+    }
+
+    [DllImport("user32.dll")]
+    private static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
+
+    [DllImport("kernel32.dll")]
+    private static extern uint GetTickCount();
+
+    // 默认输出设备（eRender=0, eMultimedia=1）的实时峰值，范围 0.0 到 1.0
+    public static float GetPeak()
+    {
+        IMMDeviceEnumerator en = (IMMDeviceEnumerator)(new MMDeviceEnumeratorComObject());
+        IMMDevice dev = null;
+        object meterObj = null;
+        try
+        {
+            int hr = en.GetDefaultAudioEndpoint(0, 1, out dev);
+            if (hr != 0) throw new COMException("GetDefaultAudioEndpoint", hr);
+
+            Guid iid = typeof(IAudioMeterInformation).GUID;
+            hr = dev.Activate(ref iid, 1 /* CLSCTX_INPROC_SERVER */, IntPtr.Zero, out meterObj);
+            if (hr != 0) throw new COMException("Activate", hr);
+
+            IAudioMeterInformation meter = (IAudioMeterInformation)meterObj;
+            float peak;
+            hr = meter.GetPeakValue(out peak);
+            if (hr != 0) throw new COMException("GetPeakValue", hr);
+            return peak;
+        }
+        finally
+        {
+            if (meterObj != null) Marshal.ReleaseComObject(meterObj);
+            if (dev != null) Marshal.ReleaseComObject(dev);
+            if (en != null) Marshal.ReleaseComObject(en);
+        }
+    }
+
+    // 默认输出设备的端点 ID，用来确认「默认设备还是不是 Dawn Pro」
+    public static string GetDefaultEndpointId()
+    {
+        IMMDeviceEnumerator en = (IMMDeviceEnumerator)(new MMDeviceEnumeratorComObject());
+        IMMDevice dev = null;
+        try
+        {
+            int hr = en.GetDefaultAudioEndpoint(0, 1, out dev);
+            if (hr != 0) throw new COMException("GetDefaultAudioEndpoint", hr);
+            string id;
+            hr = dev.GetId(out id);
+            if (hr != 0) throw new COMException("GetId", hr);
+            return id;
+        }
+        finally
+        {
+            if (dev != null) Marshal.ReleaseComObject(dev);
+            if (en != null) Marshal.ReleaseComObject(en);
+        }
+    }
+
+    // 最后一次键盘/鼠标输入距今多少秒；取不到时返回 0（保守：当成「人就在电脑前」）
+    public static double GetIdleSeconds()
+    {
+        LASTINPUTINFO lii = new LASTINPUTINFO();
+        lii.cbSize = (uint)Marshal.SizeOf(typeof(LASTINPUTINFO));
+        if (!GetLastInputInfo(ref lii)) return 0.0;
+        uint now = GetTickCount();
+        uint idle = now - lii.dwTime;
+        return idle / 1000.0;
+    }
+}
+'@
+
+$probeOk = $false
+try {
+    # -ErrorAction SilentlyContinue：重复加载同类型会报「类型已存在」，无害
+    Add-Type -TypeDefinition $probeSrc -Language CSharp -ErrorAction SilentlyContinue
+    $probeOk = $true
+} catch {
+    Write-Log ('WASAPI 探针编译失败：' + $_.Exception.Message) 'ERROR'
+}
+
+function Get-PeakBurst {
+    <# 连采 ProbeBurst 次，返回最大值；全部失败返回 $null（=未知，不是 0） #>
+    if (-not $probeOk) { return $null }
+    $max = -1.0
+    $okCount = 0
+    for ($i = 0; $i -lt $ProbeBurst; $i++) {
+        try {
+            $v = [double][DshAudioProbe]::GetPeak()
+            if ($v -gt $max) { $max = $v }
+            $okCount++
+        } catch { }
+        if ($i -lt ($ProbeBurst - 1)) { Start-Sleep -Milliseconds $ProbeGapMs }
+    }
+    if ($okCount -eq 0) { return $null }
+    return $max
+}
+
+function Get-InputIdleMinutes {
+    <# 用户多久没碰键盘鼠标；失败时返回 0（保守，避免误判「人不在」） #>
+    if (-not $probeOk) { return 0.0 }
+    try { return ([DshAudioProbe]::GetIdleSeconds() / 60.0) } catch { return 0.0 }
+}
+
+# ---------------- 端点映射 ----------------
 
 $TargetVid = 'VID_2FC6&PID_F06A'
 
@@ -118,9 +299,11 @@ $script:LastReset = $null
 $script:ResetTimes = New-Object System.Collections.ArrayList
 
 function Test-CanReset {
+    param([int]$Cooldown = 0)
     $now = Get-Date
-    if ($script:LastReset -and (($now - $script:LastReset).TotalSeconds -lt $CooldownSeconds)) {
-        Write-Log ("冷却中：距上次复位 {0:N0} 秒（阈值 {1} 秒），跳过" -f ($now - $script:LastReset).TotalSeconds, $CooldownSeconds) 'WARN'
+    $cd = if ($Cooldown -gt 0) { $Cooldown } else { $CooldownSeconds }
+    if ($script:LastReset -and (($now - $script:LastReset).TotalSeconds -lt $cd)) {
+        Write-Log ("冷却中：距上次复位 {0:N0} 秒（本次判据冷却 {1} 秒），跳过" -f ($now - $script:LastReset).TotalSeconds, $cd) 'WARN'
         return $false
     }
     $recent = @($script:ResetTimes | Where-Object { ($now - $_).TotalHours -lt 1 })
@@ -134,14 +317,17 @@ function Test-CanReset {
 }
 
 function Invoke-Reset {
-    param([string]$Reason)
+    param([string]$Reason, [int]$Cooldown = 0)
 
     Write-Log "=== 触发复位：$Reason ==="
+    if (-not (Test-CanReset -Cooldown $Cooldown)) { return $false }
     if ($DryRun) {
-        Write-Log 'DryRun：只记录，不执行任何复位动作' 'WARN'
+        # DryRun 也走同样的限流：否则日志里每轮都报一次，看不出真实的触发频率
+        $script:LastReset = Get-Date
+        [void]$script:ResetTimes.Add($script:LastReset)
+        Write-Log 'DryRun：只记录，不执行任何复位动作（已按真实限流计时）' 'WARN'
         return $true
     }
-    if (-not (Test-CanReset)) { return $false }
 
     $t = Get-Date
     $script:LastReset = $t
@@ -180,13 +366,26 @@ function Invoke-Reset {
 }
 
 # ---------------- 启动 ----------------
-Write-Log '=== Dawn Pro 音频守护启动 ==='
-Write-Log ("参数：DryRun={0} Simulate={1} Poll={2}s Cooldown={3}s MaxPerHour={4} Idle={5}min Refresh={6}min" -f $DryRun, $Simulate, $PollSeconds, $CooldownSeconds, $MaxPerHour, $IdleMinutes, $RefreshIntervalMinutes)
+Write-Log '=== Dawn Pro 音频守护启动（v1.2.0）==='
+Write-Log ("参数：DryRun={0} Simulate={1} Poll={2}s Cooldown={3}s MaxPerHour={4} IdleInput={5}min Refresh={6}min PeakWin={7}s Thr={8} Burst={9}x{10}ms" -f `
+    $DryRun, $Simulate, $PollSeconds, $CooldownSeconds, $MaxPerHour, $IdleMinutes, $RefreshIntervalMinutes, $PeakWindowSeconds, $SilenceThreshold, $ProbeBurst, $ProbeGapMs)
 
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin -and -not $DryRun) {
     Write-Log '需要管理员权限（要执行设备重启与服务重启）。' 'ERROR'
     exit 1
+}
+
+if (-not $probeOk) {
+    Write-Log 'WASAPI 探针不可用 → 判据 A/B 都无法评估，守护将只做端点补偿与短命流检测（不会主动刷新引擎）' 'ERROR'
+}
+else {
+    try {
+        $defId = [DshAudioProbe]::GetDefaultEndpointId()
+        Write-Log ("当前默认输出端点：{0}" -f $defId)
+    } catch {
+        Write-Log ('读取默认端点失败：' + $_.Exception.Message) 'WARN'
+    }
 }
 
 if ($Simulate) {
@@ -202,34 +401,47 @@ if ($ep0) {
 }
 $wasActive = [bool]($ep0 -and $ep0.Active)
 
+# 探针自检：确认这个运行身份下真的读得到峰值（SYSTEM 会话读不到，会是 null）
+if ($probeOk) {
+    $p0 = Get-PeakBurst
+    $i0 = Get-InputIdleMinutes
+    if ($null -eq $p0) {
+        Write-Log '探针自检：读取默认端点峰值失败（独占模式 / 端点切换中 / 权限不足）' 'WARN'
+    } else {
+        Write-Log ("探针自检：默认端点峰值={0:F6}，键鼠空闲={1:N1} 分钟" -f $p0, $i0)
+    }
+}
+
 $lastCheck = Get-Date
 $pendingStart = $null
 $shortStreams = New-Object System.Collections.ArrayList
 $lastHeartbeat = Get-Date
 $runStart = Get-Date
 $streaming = $false               # 是否有活跃音频流（最后一条流事件是 24 且还没收到 25）
-$lastStreamStop = Get-Date        # 最后一次「流结束 / 暂停」的时刻，静置计时起点
-$lastRefreshTime = [datetime]::MinValue  # 上次刷新引擎的时刻；静置期间按 RefreshIntervalMinutes 反复刷，不是只刷一次
+$lastStreamStart = $null          # 最近一次 Event 24 的时刻（用于 12 小时兜底）
+$peaks = New-Object System.Collections.ArrayList   # 峰值样本 {T=时刻, V=值}
+$lastRefreshTime = [datetime]::MinValue
+$probeFailStreak = 0
+$probeWarned = $false
+
 # 引擎刚重建过（audiodg 启动不到 10 分钟）就不必再刷一次，否则守护每次重启都会立刻多刷一遍
 $ag = Get-Process audiodg -ErrorAction SilentlyContinue
 if ($ag -and ((Get-Date) - $ag.StartTime).TotalMinutes -lt 10) {
-    # 引擎刚重建过：只是「刚刷过」这一点要记住，不是把整轮静置都豁免掉
     $lastRefreshTime = $ag.StartTime
     Write-Log ('启动检测：audiodg 于 {0:HH:mm:ss} 启动，不足 10 分钟，视为引擎刚刷新过（{1} 分钟后才允许再刷）' -f $ag.StartTime, $RefreshIntervalMinutes)
 }
 else {
-    Write-Log '启动检测：audiodg 不是刚重建，lastRefreshTime 保持初始值（首轮满足静置条件即可刷新）'
+    Write-Log '启动检测：audiodg 不是刚重建，lastRefreshTime 保持初始值（首轮满足条件即可刷新）'
 }
 
-# 启动时先扫一遍最近的流事件，建立「当前是否在播放」的初始状态
-# （只读增量的话，守护重启后 streaming 会一直是 false，可能在你正听歌时误判）
+# 启动时先扫一遍最近的流事件，建立 streaming 的初始状态
+# （判据 A 需要它：有播放意图但没输出，才是确定故障）
 $initEvs = @(Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-Audio/PlaybackManager'; StartTime = (Get-Date).AddHours(-24) } -ErrorAction SilentlyContinue)
 $initLast = $null
 foreach ($e in @($initEvs | Sort-Object TimeCreated)) {
     if ($e.Id -eq 24 -or $e.Id -eq 25 -or $e.Id -eq 22) { $initLast = $e }
 }
 if ($initLast) {
-    $lastStreamStop = $initLast.TimeCreated
     if ($initLast.Id -eq 24) { $streaming = $true }
     Write-Log ("启动状态：最近流事件 Id={0} @ {1:HH:mm:ss}，streaming={2}" -f $initLast.Id, $initLast.TimeCreated, $streaming)
 } else {
@@ -245,6 +457,40 @@ while ($true) {
         break
     }
 
+    # --- 采一次峰值（连采 ProbeBurst 次取最大，防止短音漏采）---
+    $peak = Get-PeakBurst
+    if ($null -eq $peak) {
+        $probeFailStreak++
+        if (-not $probeWarned -and $probeFailStreak -ge 3) {
+            Write-Log 'WASAPI 峰值连续读取失败 → 判据视为「未知」，不做主动刷新（独占模式/ASIO 输出也会读不到）' 'WARN'
+            $probeWarned = $true
+        }
+    }
+    else {
+        if ($probeFailStreak -gt 0) { Write-Log ("WASAPI 峰值恢复读取（此前连续失败 {0} 次）" -f $probeFailStreak) }
+        $probeFailStreak = 0
+        $probeWarned = $false
+        [void]$peaks.Add([pscustomobject]@{ T = $now; V = [double]$peak })
+    }
+
+    # 裁剪滑窗
+    $winCut = $now.AddSeconds(-$PeakWindowSeconds)
+    $keepP = @($peaks | Where-Object { $_.T -gt $winCut })
+    $peaks = New-Object System.Collections.ArrayList
+    foreach ($x in $keepP) { [void]$peaks.Add($x) }
+
+    $winMax = $null
+    $winSpan = 0.0
+    if ($keepP.Count -gt 0) {
+        $winMax = [double](($keepP | Measure-Object -Property V -Maximum).Maximum)
+        $winSpan = ($now - $keepP[0].T).TotalSeconds
+    }
+    # 窗口必须「基本填满」才允许下结论，否则刚启动那 90 秒会用不完整的数据误判。
+    # 注意：窗口是按时间裁剪的，最老那个样本天然落在窗口边缘内侧，跨度上限天然等于
+    #       PeakWindowSeconds 减去约一个轮询周期，所以门槛不能写成 0.9 倍（那样永不成立）。
+    $winSlack = $PollSeconds * 3 + 5
+    $winFull = ($keepP.Count -ge 3) -and ($winSpan -ge ($PeakWindowSeconds - $winSlack))
+
     # --- 补偿信号：端点从非 ACTIVE 恢复为 ACTIVE ---
     $ep = Get-PrimaryEndpoint
     if ($ep) {
@@ -256,12 +502,13 @@ while ($true) {
         $wasActive = [bool]$ep.Active
     }
 
-    # --- 主信号：短命音频流（建流失败模式）---
+    # --- 维护 streaming（只给判据 A 用，不作单独判据）---
     $evs = @(Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-Audio/PlaybackManager'; StartTime = $lastCheck } -ErrorAction SilentlyContinue)
     $lastCheck = $now
     foreach ($e in @($evs | Sort-Object TimeCreated)) {
         if ($e.Id -eq 24) {
             $pendingStart = $e.TimeCreated
+            $lastStreamStart = $e.TimeCreated
             $streaming = $true
         } elseif ($e.Id -eq 25) {
             if ($pendingStart) {
@@ -270,13 +517,18 @@ while ($true) {
                 $pendingStart = $null
             }
             $streaming = $false
-            $lastStreamStop = $e.TimeCreated
         } elseif ($e.Id -eq 22) {
             $streaming = $false
-            $lastStreamStop = $e.TimeCreated
         }
     }
 
+    # streaming 卡住 12 小时说明应用没发 25（事件通道不全），按无流处理，免得判据 A 永远成立
+    if ($streaming -and $lastStreamStart -and (($now - $lastStreamStart).TotalHours -ge 12)) {
+        Write-Log ("streaming 已持续 {0:N0} 小时未见停止事件，按无流处理" -f ($now - $lastStreamStart).TotalHours) 'WARN'
+        $streaming = $false
+    }
+
+    # --- 短命流（辅助信号，独立于峰值）---
     $cut = $now.AddSeconds(-$StreamWindowSeconds)
     $keep = @($shortStreams | Where-Object { $_ -gt $cut })
     $shortStreams = New-Object System.Collections.ArrayList
@@ -287,47 +539,39 @@ while ($true) {
         [void](Invoke-Reset -Reason ("{0} 秒内出现 {1} 次短命音频流（疑似播放器建流失败）" -f $StreamWindowSeconds, $keep.Count))
     }
 
-    # --- 主判据：静置刷新 ---
-    # 判定「有没有在播放」不看 CPU：实测 audiodg 在完全没播放时每 5 秒也在消耗
-    # 0.015~0.125 秒 CPU（约 1.2%），和播放时分不开，这条路作废。
-    # 改看 PlaybackManager 的流状态：
-    #   最后一条流事件是 24（流启动、还没收到 25）→ 正在播放，不动它
-    #   最后一条是 25/22（流停止/暂停），或压根没有新事件 → 无流，从那一刻开始算静置
-    # 这样即使故障期间一条事件都没有（10-20 20:43 那次就是），也能按「最后一次停止」计时
-    if ($streaming -and ($now - $lastStreamStop).TotalHours -ge 12) {
-        Write-Log '流状态已持续 12 小时未见停止事件，按无流处理（防止应用没发 25 导致永远不复位）；同时把静置计时起点重置为现在，免得立刻触发刷新' 'WARN'
-        $streaming = $false
-        $lastStreamStop = $now
-    }
-
-    $idleMin = ($now - $lastStreamStop).TotalMinutes
-    $sinceRefresh = ($now - $lastRefreshTime).TotalMinutes
+    # --- 主判据 ---
     $awakeMin = ($now - $runStart).TotalMinutes
-    # 三个门同时满足才刷：① 没有活跃流 ② 静置够久 ③ 距上次刷新够久（否则静置一小时就只刷一次）
-    # 外加 ④ 守护自己至少醒了 5 分钟，避免刚启动就刷（那是无意义的抖动）
-    if (-not $streaming -and $idleMin -ge $IdleMinutes -and $sinceRefresh -ge $RefreshIntervalMinutes -and $awakeMin -ge $StartupGraceMinutes) {
-        # 触发前复查：最近 60 秒内有任何音频事件就跳过（降低「刚好开始播放」的误判）
-        $recentEvs = @(Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-Audio/PlaybackManager'; StartTime = $now.AddSeconds(-60) } -ErrorAction SilentlyContinue)
-        if ($recentEvs.Count -gt 0) {
-            Write-Log ("静置 {0:N0} 分钟，但最近 60 秒有 {1} 条新音频事件，跳过本次刷新" -f $idleMin, $recentEvs.Count)
+    $idleInputMin = Get-InputIdleMinutes
+    $sinceRefresh = ($now - $lastRefreshTime).TotalMinutes
+
+    if ($DebugPeak) {
+        $dbgMax = if ($null -eq $winMax) { 'null' } else { $winMax.ToString('F6') }
+        Write-Log ("DEBUG 峰值窗最大={0} 样本={1} 跨度={2:N1}s winFull={3} 键鼠空闲={4:N1}min streaming={5} 醒着={6:N1}min 距上次刷新={7:N1}min 探针失败={8}" -f $dbgMax, $keepP.Count, $winSpan, $winFull, $idleInputMin, $streaming, $awakeMin, $sinceRefresh, $probeFailStreak)
+    }
+
+    if ($probeFailStreak -eq 0 -and $winFull -and $null -ne $winMax -and $winMax -lt $SilenceThreshold -and $awakeMin -ge $StartupGraceMinutes) {
+
+        # 判据 A：有播放意图（收到过 24）但整整 90 秒没有任何音频输出
+        if ($streaming) {
+            $why = ("判据A：有播放意图（最后一条流事件是启动）但 {0} 秒窗口峰值最大仅 {1:F6}，判定引擎坏死" -f $PeakWindowSeconds, $winMax)
+            [void](Invoke-Reset -Reason $why -Cooldown $HardCooldownSeconds)
+            if ($script:LastReset) { $lastRefreshTime = Get-Date }
         }
-        else {
-            $didReset = Invoke-Reset -Reason ("已静置 {0:N0} 分钟无音频流（最后一条流事件是停止/暂停），预防性刷新引擎" -f $idleMin)
-            if ($didReset) {
-                $lastRefreshTime = Get-Date
-                $lastStreamStop = $lastRefreshTime
-            }
+        # 判据 B：没人在用电脑、也没声音 → 安全刷新（覆盖「静置后首播失败」）
+        elseif ($idleInputMin -ge $IdleMinutes -and $sinceRefresh -ge $RefreshIntervalMinutes) {
+            $why = ("判据B：用户已 {0:N0} 分钟无键鼠输入，且 {1} 秒窗口峰值最大仅 {2:F6}，预防性刷新引擎" -f $idleInputMin, $PeakWindowSeconds, $winMax)
+            $did = Invoke-Reset -Reason $why -Cooldown ($RefreshIntervalMinutes * 60)
+            if ($did) { $lastRefreshTime = Get-Date }
         }
     }
 
-    # --- 心跳（每 30 分钟一行，便于确认守护还活着）---
+    # --- 心跳（每 30 分钟一行，便于确认守护还活着、以及它当时看到了什么）---
     if (($now - $lastHeartbeat).TotalMinutes -ge 30) {
         $lastHeartbeat = $now
         $cur = Get-PrimaryEndpoint
         $svc = Get-Service Audiosrv -ErrorAction SilentlyContinue
         $state = if ($cur) { $cur.State } else { 'N/A' }
-        $idle = [int]($now - $lastStreamStop).TotalMinutes
-        $tag = if ($streaming) { '播放中' } else { ('静置 ' + $idle + ' 分钟') }
-        Write-Log ("心跳：端点 State={0}，Audiosrv={1}，{2}" -f $state, $svc.Status, $tag)
+        $peakTxt = if ($null -eq $winMax) { 'N/A' } else { ('{0:F6}' -f $winMax) }
+        Write-Log ("心跳：端点 State={0}，Audiosrv={1}，峰值窗最大={2}，键鼠空闲={3:N0}分钟，streaming={4}" -f $state, $svc.Status, $peakTxt, $idleInputMin, $streaming)
     }
 }

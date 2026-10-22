@@ -1,3 +1,2 @@
 *.log
-*.blend1
-__pycache__/
+*.log.bak
