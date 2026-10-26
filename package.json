@@ -1,7 +1,7 @@
 {
   "name": "dawn-pro-audio-fix",
-  "version": "1.2.0",
-  "description": "修复 MOONDROP Dawn Pro 在 Windows 上「连上了却不出声」的音频引擎卡死：手动一键修复 + 后台守护（WASAPI 峰值 + 键鼠空闲判据）",
+  "version": "1.3.0",
+  "description": "修复 MOONDROP Dawn Pro 在 Windows 上「连上了却不出声」的音频引擎卡死：全局热键一键修复（含故障现场取证）+ 手动修复 + 后台守护",
   "keywords": [
     "windows",
     "audio",
@@ -9,7 +9,8 @@
     "moondrop",
     "audiosrv",
     "wasapi",
-    "powershell"
+    "powershell",
+    "hotkey"
   ],
   "license": "MIT",
   "repository": {
@@ -17,7 +18,8 @@
     "url": "https://github.com/wuuuuu123-32/dawn-pro-audio-fix.git"
   },
   "scripts": {
-    "check": "powershell -ExecutionPolicy Bypass -File fix-audio.ps1 -CheckOnly"
+    "check": "powershell -ExecutionPolicy Bypass -File fix-audio.ps1 -CheckOnly",
+    "hotkey-install": "powershell -ExecutionPolicy Bypass -File _install-hotkey.ps1"
   },
   "os": [
     "win32"

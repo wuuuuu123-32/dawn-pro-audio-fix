@@ -11,12 +11,47 @@
 
 两种情况都能靠**重启 Windows 音频服务（`Audiosrv`）**立刻恢复 —— 这就是这个工具做的事。
 
-## 两个工具，选一个
+## 三个工具，选一个
 
 | | 用法 | 适合 |
 |---|---|---|
-| **手动版** `fix-audio.cmd` | 双击 → UAC → 修完自动关 | 你发现没声音了，点一下 |
+| **热键版** `hotkey-fix.ps1` | 常驻监听，按 `Ctrl+Alt+Shift+A` 立刻修 | 想按一下就修，不想找图标（**推荐**） |
+| **手动版** `fix-audio.cmd` | 双击 → UAC → 修完自动关 | 偶尔用一次，不想装常驻进程 |
 | **守护版** `audio-guard.ps1` | 装成计划任务后开机自启 | 想让它自动修 |
+
+### 热键版（推荐）
+
+装好后常驻监听 **`Ctrl+Alt+Shift+A`**，按下立刻修，不用回桌面找图标。
+
+```powershell
+# 安装（需要管理员）
+powershell -ExecutionPolicy Bypass -File _install-hotkey.ps1
+```
+
+**它会在重启服务之前先抓一份现场快照。** 这类故障在系统日志里一条记录都没有（2026-10-26 实测：故障前后 45 分钟，`Audio/Operational`、`PlaybackManager`、`Event 65` 全是 0 条），唯一的机会就是按下热键到服务重启之间那两三秒。
+
+每次按热键都会往 `snapshot.log` 追加：
+
+- 默认端点峰值（6 次采样，给最大值、平均值和逐个样本）
+- 每个渲染会话的 `pid / 进程名 / state`（Inactive / Active / Expired）
+- 每个采集会话（谁在用麦克风 —— 录音或会议时重启会打断）
+- 键鼠空闲秒数
+- `audiodg` 的 PID、启动时间、CPU
+- 修复后再采一次，和故障态前后对照
+
+攒几次就能看清「引擎坏死」到底长什么样。
+
+实现上的几个点：
+
+- 计划任务是「**仅用户登录时运行** + 最高权限 + 单实例」。必须在交互会话里，否则 `RegisterHotKey` 注册成功也不响应（它的「全局」范围是当前窗口站/桌面，不是跨会话）。
+- 热键注册失败会弹一次 MessageBox —— 提权进程发 Toast 不可靠，只写日志你会以为它工作了。
+- 5 秒冷却，执行期间不处理消息并丢弃积压，连按不会叠加。
+- 卸载：
+
+```powershell
+Stop-ScheduledTask -TaskName DawnProAudioHotkey
+Unregister-ScheduledTask -TaskName DawnProAudioHotkey -Confirm:$false
+```
 
 ### 手动版
 
